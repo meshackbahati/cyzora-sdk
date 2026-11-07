@@ -1,0 +1,17 @@
+{
+  "name": "cyzora/cyzora",
+  "description": "Cyzora M-Pesa payment rail SDK for PHP — charges, checkout, payouts, wallets and webhook verification.",
+  "type": "library",
+  "license": "MIT",
+  "keywords": ["cyzora", "mpesa", "payments", "payouts", "kenya", "mobile-money", "stk"],
+  "require": {
+    "php": ">=7.4",
+    "ext-curl": "*",
+    "ext-json": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "Cyzora\\": "src/"
+    }
+  }
+}
