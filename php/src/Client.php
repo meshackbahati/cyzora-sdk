@@ -32,11 +32,17 @@ class Client
     public const DEFAULT_BASE_URL = 'https://api.cyzora.co.ke/api/v1';
     public const PAYOUT_MIN_CENTS = 3000; // KES 30
 
+    /** Known webhook event names. The rail evolves, so also compare raw event strings. */
+    public const WEBHOOK_EVENTS = [
+        'charge.succeeded', 'charge.failed', 'charge.expired', 'payout.paid', 'payout.failed',
+    ];
+
     private string $secretKey;
     private string $baseUrl;
     /** @var string[] */
     private array $webhookSecrets;
     private int $timeout;
+    private int $maxRetries;
 
     /**
      * @param array{baseUrl?:string, webhookSecret?:string|string[], timeout?:int} $options
@@ -49,6 +55,7 @@ class Client
         $this->secretKey = $secretKey;
         $this->baseUrl = rtrim($options['baseUrl'] ?? self::DEFAULT_BASE_URL, '/');
         $this->timeout = (int)($options['timeout'] ?? 30);
+        $this->maxRetries = (int)($options['maxRetries'] ?? 2);
         $ws = $options['webhookSecret'] ?? null;
         if ($ws === null) {
             $this->webhookSecrets = [];
@@ -126,26 +133,47 @@ class Client
         if ($payload !== null) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
         }
-        $response = curl_exec($ch);
-        if ($response === false) {
-            $err = curl_error($ch);
+        // Retrying is only safe when the rail can dedupe: GETs, or POSTs with an idempotency key.
+        $canRetry = strtoupper($method) === 'GET' || $idempotencyKey !== null;
+        $attempt = 0;
+        while (true) {
+            $response = curl_exec($ch);
+            if ($response === false) {
+                $err = curl_error($ch);
+                if ($canRetry && $attempt < $this->maxRetries) { $attempt++; usleep((int)(250000 * (2 ** ($attempt - 1)))); continue; }
+                curl_close($ch);
+                throw new CyzoraException('Could not reach Cyzora: ' . $err);
+            }
+            $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $data = [];
+            $text = (string)$response;
+            if ($text !== '') {
+                $decoded = json_decode($text, true);
+                $data = is_array($decoded) ? $decoded : ['raw' => $text];
+            }
+            if ($status < 200 || $status >= 300) {
+                $transient = $status >= 500 || $status === 429;
+                if ($transient && $canRetry && $attempt < $this->maxRetries) { $attempt++; usleep((int)(250000 * (2 ** ($attempt - 1)))); continue; }
+                curl_close($ch);
+                $msg = $data['error'] ?? $data['message'] ?? ('Cyzora request failed (' . $status . ')');
+                throw new CyzoraException((string)$msg, $status, $data);
+            }
             curl_close($ch);
-            throw new CyzoraException('Could not reach Cyzora: ' . $err);
+            return $data;
         }
-        $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+    }
 
-        $data = [];
-        $text = (string)$response;
-        if ($text !== '') {
-            $decoded = json_decode($text, true);
-            $data = is_array($decoded) ? $decoded : ['raw' => $text];
-        }
-        if ($status < 200 || $status >= 300) {
-            $msg = $data['error'] ?? $data['message'] ?? ('Cyzora request failed (' . $status . ')');
-            throw new CyzoraException((string)$msg, $status, $data);
-        }
-        return $data;
+    /**
+     * Escape hatch for any endpoint, including new ones the rail adds before this
+     * SDK ships a typed wrapper. $path is appended to the base URL.
+     *
+     * @param array<string,mixed>|null $body
+     * @param array<string,mixed>|null $query
+     * @return array<string,mixed>
+     */
+    public function rawRequest(string $method, string $path, ?array $body = null, ?string $idempotencyKey = null, ?array $query = null): array
+    {
+        return $this->request($path, $method, $body, $idempotencyKey, $query);
     }
 
     // -- charges ----------------------------------------------------------

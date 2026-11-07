@@ -4,6 +4,8 @@ Client libraries for the **Cyzora** M-Pesa payment rail — charges (STK push), 
 checkout, payouts, wallets and webhook verification. Available for **TypeScript/Node.js**,
 **Python**, **PHP** and **Go**.
 
+📘 **Full runnable examples: [EXAMPLES.md](./EXAMPLES.md)** (charges, webhook handlers, payouts, escape hatch).
+
 > Amounts on the wire are **integer cents of whole shillings** (KES 2,500 → `250000`).
 > Every money-moving request should carry an **idempotency key** so a retry cannot
 > double-charge or double-pay. The smallest payout is **KES 30**.
@@ -201,6 +203,42 @@ Helpers exported everywhere: `normalizePhone`, `toCents`, `fromCents`, `PAYOUT_M
   complete it).
 - **Payout minimum is KES 30.** Reject smaller withdrawals before calling the API.
 - **Keep keys server-side.** Never ship `sk_live_`/`whsec_` to a browser or client app.
+
+## Advanced
+
+### The rail is evolving — call any endpoint
+Cyzora started with M-Pesa but is growing fast (more networks, methods and endpoints).
+You never have to wait for an SDK release to use a new endpoint — every client exposes a
+generic escape hatch that signs, retries and parses like the typed methods:
+
+```ts
+await cyzora.request("POST", "/charges", { body: { amount: 25000, phone: "254712345678", network: "airtel" }, idempotencyKey: "k1" });
+const x = await cyzora.request("GET", "/some-brand-new-endpoint");
+```
+```python
+client.request("POST", "/charges", body={...}, idempotency_key="k1")
+client.request("GET", "/some-brand-new-endpoint")
+```
+```php
+$cyzora->rawRequest('POST', '/charges', $body, 'k1');
+$cyzora->rawRequest('GET', '/some-brand-new-endpoint');
+```
+```go
+client.Request(ctx, "POST", "/charges", body, "k1", nil)
+client.Request(ctx, "GET", "/some-brand-new-endpoint", nil, "", nil)
+```
+Charges already take a `network` field (`mpesa`, `airtel`, …), so new networks need no SDK change.
+
+### Automatic retries
+Transient failures (network errors, HTTP 5xx and 429) are retried with exponential backoff
+(default 2 retries; configure with `maxRetries` / `WithMaxRetries`). Retries only happen when
+they are safe: **GET requests, or any request carrying an idempotency key** — so a retried
+charge or payout can never double-execute.
+
+### Webhook event names
+Constants are provided for convenience, but always handle unknown events gracefully as the
+rail adds more: `WebhookEvents` (TS), `WEBHOOK_EVENTS` (Python), `Client::WEBHOOK_EVENTS`
+(PHP), `EventChargeSucceeded`/`EventPayoutPaid`/… (Go).
 
 ## Repository layout
 

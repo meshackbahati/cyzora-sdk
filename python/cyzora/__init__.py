@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,11 +26,20 @@ from typing import Any, Dict, List, Optional, Union
 
 __all__ = [
     "Cyzora", "CyzoraError", "normalize_phone", "to_cents", "from_cents",
-    "PAYOUT_MIN_CENTS",
+    "PAYOUT_MIN_CENTS", "WEBHOOK_EVENTS",
 ]
 
 DEFAULT_BASE_URL = "https://api.cyzora.co.ke/api/v1"
 PAYOUT_MIN_CENTS = 3000  # KES 30
+
+#: Known webhook event names. The rail evolves, so also compare raw event strings.
+WEBHOOK_EVENTS = {
+    "charge_succeeded": "charge.succeeded",
+    "charge_failed": "charge.failed",
+    "charge_expired": "charge.expired",
+    "payout_paid": "payout.paid",
+    "payout_failed": "payout.failed",
+}
 
 _PHONE_RE = re.compile(r"^254[17]\d{8}$")
 
@@ -76,12 +86,14 @@ class Cyzora:
         base_url: str = DEFAULT_BASE_URL,
         webhook_secret: Optional[Union[str, List[str]]] = None,
         timeout: float = 30.0,
+        max_retries: int = 2,
     ):
         if not secret_key:
             raise CyzoraError("secret_key is required")
         self.secret_key = secret_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.max_retries = max_retries
         if webhook_secret is None:
             self.webhook_secrets: List[str] = []
         elif isinstance(webhook_secret, str):
@@ -112,26 +124,45 @@ class Cyzora:
             headers["Idempotency-Key"] = str(idempotency_key)[:128]
 
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                text = resp.read().decode("utf-8")
-                status = resp.getcode()
-        except urllib.error.HTTPError as e:
-            text = e.read().decode("utf-8", "replace")
-            status = e.code
-        except urllib.error.URLError as e:
-            raise CyzoraError(f"Could not reach Cyzora: {e.reason}")
-
-        parsed: Any = {}
-        if text:
+        # Retrying is only safe when the rail can dedupe: GETs, or POSTs with an idempotency key.
+        can_retry = method.upper() == "GET" or bool(idempotency_key)
+        attempt = 0
+        while True:
             try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
-                parsed = {"raw": text}
-        if status < 200 or status >= 300:
-            msg = (parsed or {}).get("error") or (parsed or {}).get("message") or f"Cyzora request failed ({status})"
-            raise CyzoraError(msg, status, parsed)
-        return parsed
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    text = resp.read().decode("utf-8")
+                    status = resp.getcode()
+            except urllib.error.HTTPError as e:
+                text = e.read().decode("utf-8", "replace")
+                status = e.code
+            except urllib.error.URLError as e:
+                if can_retry and attempt < self.max_retries:
+                    attempt += 1
+                    time.sleep(0.25 * (2 ** (attempt - 1)))
+                    continue
+                raise CyzoraError(f"Could not reach Cyzora: {e.reason}")
+
+            parsed: Any = {}
+            if text:
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    parsed = {"raw": text}
+            if status < 200 or status >= 300:
+                transient = status >= 500 or status == 429
+                if transient and can_retry and attempt < self.max_retries:
+                    attempt += 1
+                    time.sleep(0.25 * (2 ** (attempt - 1)))
+                    continue
+                msg = (parsed or {}).get("error") or (parsed or {}).get("message") or f"Cyzora request failed ({status})"
+                raise CyzoraError(msg, status, parsed)
+            return parsed
+
+    def request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None,
+                idempotency_key: Optional[str] = None, query: Optional[Dict[str, Any]] = None) -> Any:
+        """Escape hatch for any endpoint, including new ones the rail adds before
+        this SDK ships a typed wrapper. `path` is appended to the base URL."""
+        return self._request(path, method=method, body=body, idempotency_key=idempotency_key, query=query)
 
     # -- charges -----------------------------------------------------------
     def create_charge(

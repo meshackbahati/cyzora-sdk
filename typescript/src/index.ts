@@ -60,7 +60,21 @@ export interface CyzoraOptions {
   webhookSecrets?: string | string[];
   /** Fetch implementation override (for tests / older runtimes). */
   fetchImpl?: typeof fetch;
+  /** Max automatic retries on network/5xx/429 errors (default 2). Retries only happen for GETs or when an idempotency key is set. */
+  maxRetries?: number;
 }
+
+/** Known webhook event names. The rail evolves, so compare against `event` strings directly too. */
+export const WebhookEvents = {
+  ChargeSucceeded: 'charge.succeeded',
+  ChargeFailed: 'charge.failed',
+  ChargeExpired: 'charge.expired',
+  PayoutPaid: 'payout.paid',
+  PayoutFailed: 'payout.failed',
+} as const;
+export type WebhookEvent = typeof WebhookEvents[keyof typeof WebhookEvents];
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Error thrown for any non-2xx response or transport failure. */
 export class CyzoraError extends Error {
@@ -103,6 +117,7 @@ export class Cyzora {
   private readonly secretKey: string;
   private readonly webhookSecrets: string[];
   private readonly fetchImpl: typeof fetch;
+  private readonly maxRetries: number;
 
   constructor(opts: CyzoraOptions) {
     if (!opts?.secretKey) throw new CyzoraError('secretKey is required');
@@ -113,9 +128,21 @@ export class Cyzora {
       : [];
     this.webhookSecrets = secrets.filter(Boolean);
     this.fetchImpl = opts.fetchImpl || fetch;
+    this.maxRetries = opts.maxRetries ?? 2;
   }
 
-  private async request<T = any>(path: string, init: { method?: string; body?: unknown; idempotencyKey?: string; query?: Record<string, string | number | undefined> } = {}): Promise<T> {
+  /**
+   * Escape hatch for any endpoint — including new ones the rail adds before this
+   * SDK ships a typed wrapper. `path` is appended to the base URL.
+   *
+   *   cyzora.request('POST', '/charges', { body: {...}, idempotencyKey: 'k' })
+   *   cyzora.request('GET', '/some-new-endpoint')
+   */
+  request<T = any>(method: string, path: string, init: { body?: unknown; idempotencyKey?: string; query?: Record<string, string | number | undefined> } = {}): Promise<T> {
+    return this._request<T>(path, { ...init, method });
+  }
+
+  private async _request<T = any>(path: string, init: { method?: string; body?: unknown; idempotencyKey?: string; query?: Record<string, string | number | undefined> } = {}): Promise<T> {
     const url = new URL(`${this.baseUrl}${path}`);
     if (init.query) {
       for (const [k, v] of Object.entries(init.query)) if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
@@ -123,23 +150,30 @@ export class Cyzora {
     const headers: Record<string, string> = { 'X-API-Key': this.secretKey, Accept: 'application/json' };
     if (init.body !== undefined) headers['Content-Type'] = 'application/json';
     if (init.idempotencyKey) headers['Idempotency-Key'] = String(init.idempotencyKey).slice(0, 128);
+    const method = init.method || (init.body !== undefined ? 'POST' : 'GET');
+    // Retrying is only safe when the rail can dedupe: GETs, or POSTs carrying an idempotency key.
+    const canRetry = method.toUpperCase() === 'GET' || !!init.idempotencyKey;
+    const bodyStr = init.body === undefined ? undefined : JSON.stringify(init.body);
 
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        method: init.method || (init.body !== undefined ? 'POST' : 'GET'),
-        headers,
-        body: init.body === undefined ? undefined : JSON.stringify(init.body),
-      });
-    } catch (e: any) {
-      throw new CyzoraError(`Could not reach Cyzora: ${e?.message || e}`);
+    let attempt = 0;
+    for (;;) {
+      let res: Response;
+      try {
+        res = await this.fetchImpl(url, { method, headers, body: bodyStr });
+      } catch (e: any) {
+        if (canRetry && attempt < this.maxRetries) { await sleep(2 ** attempt * 250); attempt++; continue; }
+        throw new CyzoraError(`Could not reach Cyzora: ${e?.message || e}`);
+      }
+      const text = await res.text();
+      let data: any = {};
+      if (text) { try { data = JSON.parse(text); } catch { data = { raw: text }; } }
+      if (!res.ok) {
+        const transient = res.status >= 500 || res.status === 429;
+        if (transient && canRetry && attempt < this.maxRetries) { await sleep(2 ** attempt * 250); attempt++; continue; }
+        throw new CyzoraError(data?.error || data?.message || `Cyzora request failed (${res.status})`, res.status, data);
+      }
+      return data as T;
     }
-
-    const text = await res.text();
-    let data: any = {};
-    if (text) { try { data = JSON.parse(text); } catch { data = { raw: text }; } }
-    if (!res.ok) throw new CyzoraError(data?.error || data?.message || `Cyzora request failed (${res.status})`, res.status, data);
-    return data as T;
   }
 
   /** Send an M-Pesa STK prompt to a customer's phone. */
@@ -148,7 +182,7 @@ export class Cyzora {
     if (!phone) throw new CyzoraError('Enter a valid Safaricom phone number (e.g. 0712 345 678).');
     const cents = p.amountCents !== undefined ? Number(p.amountCents) : toCents(p.amountKes);
     if (!Number.isInteger(cents) || cents < 100) throw new CyzoraError('Amount must be a whole number of shillings, at least KES 1.');
-    return this.request('/charges', {
+    return this._request('/charges', {
       method: 'POST',
       idempotencyKey: p.idempotencyKey,
       body: {
@@ -163,12 +197,12 @@ export class Cyzora {
   }
 
   getCharge(chargeId: string) {
-    return this.request(`/charges/${encodeURIComponent(chargeId)}`);
+    return this._request(`/charges/${encodeURIComponent(chargeId)}`);
   }
 
   /** Hosted checkout session (redirect flow) instead of an STK push. */
   async createCheckoutSession(p: CheckoutParams) {
-    return this.request('/transactions/initialize', {
+    return this._request('/transactions/initialize', {
       method: 'POST',
       idempotencyKey: p.idempotencyKey,
       body: {
@@ -186,7 +220,7 @@ export class Cyzora {
   }
 
   verifyTransaction(reference: string) {
-    return this.request(`/transactions/verify/${encodeURIComponent(reference)}`);
+    return this._request(`/transactions/verify/${encodeURIComponent(reference)}`);
   }
 
   /** Send money out of the platform balance to a mobile/till/paybill/bank destination. */
@@ -204,28 +238,28 @@ export class Cyzora {
       else if (type === 'paybill') { body.short_code = p.shortCode; body.account_ref = p.accountRef; }
       else if (type === 'bank') { body.bank_code = p.bankCode; body.account_number = p.accountNumber; body.account_name = p.accountName; }
     }
-    return this.request('/payouts', { method: 'POST', idempotencyKey: p.idempotencyKey, body });
+    return this._request('/payouts', { method: 'POST', idempotencyKey: p.idempotencyKey, body });
   }
 
   getPayout(payoutId: string) {
-    return this.request(`/payouts/${encodeURIComponent(payoutId)}`);
+    return this._request(`/payouts/${encodeURIComponent(payoutId)}`);
   }
 
   /** Balances (in cents) for collections, collections_pending and payouts wallets. */
   getWallets() {
-    return this.request('/wallets');
+    return this._request('/wallets');
   }
 
   listPayoutChannels() {
-    return this.request('/payout-channels');
+    return this._request('/payout-channels');
   }
 
   listPayoutBanks() {
-    return this.request('/payout-banks');
+    return this._request('/payout-banks');
   }
 
   payoutFeePreview(amountKes: number, destinationType: DestinationType = 'mobile') {
-    return this.request('/payouts/fee-preview', { query: { amount: toCents(amountKes), destination_type: destinationType } });
+    return this._request('/payouts/fee-preview', { query: { amount: toCents(amountKes), destination_type: destinationType } });
   }
 
   /**

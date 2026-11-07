@@ -46,7 +46,17 @@ type Client struct {
 	baseURL        string
 	webhookSecrets []string
 	http           *http.Client
+	maxRetries     int
 }
+
+// Known webhook event names. The rail evolves, so also compare raw event strings.
+const (
+	EventChargeSucceeded = "charge.succeeded"
+	EventChargeFailed    = "charge.failed"
+	EventChargeExpired   = "charge.expired"
+	EventPayoutPaid      = "payout.paid"
+	EventPayoutFailed    = "payout.failed"
+)
 
 type Option func(*Client)
 
@@ -62,12 +72,19 @@ func WithHTTPClient(h *http.Client) Option {
 	return func(c *Client) { c.http = h }
 }
 
+// WithMaxRetries sets automatic retries on network/5xx/429 errors (default 2).
+// Retries only happen for GETs or when an idempotency key is set.
+func WithMaxRetries(n int) Option {
+	return func(c *Client) { c.maxRetries = n }
+}
+
 // New builds a Cyzora client. secretKey is the sk_live_... key.
 func New(secretKey string, opts ...Option) *Client {
 	c := &Client{
-		secretKey: secretKey,
-		baseURL:   DefaultBaseURL,
-		http:      &http.Client{Timeout: 30 * time.Second},
+		secretKey:  secretKey,
+		baseURL:    DefaultBaseURL,
+		http:       &http.Client{Timeout: 30 * time.Second},
+		maxRetries: 2,
 	}
 	for _, o := range opts {
 		o(c)
@@ -126,55 +143,80 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 		}
 	}
 
-	var reader io.Reader
+	var bodyBytes []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		reader = bytes.NewReader(b)
+		bodyBytes = b
 	}
+	if len(idempotencyKey) > 128 {
+		idempotencyKey = idempotencyKey[:128]
+	}
+	// Retrying is only safe when the rail can dedupe: GETs, or POSTs with an idempotency key.
+	canRetry := strings.ToUpper(method) == "GET" || idempotencyKey != ""
 
-	req, err := http.NewRequestWithContext(ctx, method, u, reader)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("X-API-Key", c.secretKey)
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if idempotencyKey != "" {
-		if len(idempotencyKey) > 128 {
-			idempotencyKey = idempotencyKey[:128]
+	for attempt := 0; ; attempt++ {
+		var reader io.Reader
+		if bodyBytes != nil {
+			reader = bytes.NewReader(bodyBytes)
 		}
-		req.Header.Set("Idempotency-Key", idempotencyKey)
-	}
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return &Error{Message: fmt.Sprintf("could not reach Cyzora: %v", err)}
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(resp.Body)
-	data := map[string]interface{}{}
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &data)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg := fmt.Sprintf("Cyzora request failed (%d)", resp.StatusCode)
-		if m, ok := data["error"].(string); ok && m != "" {
-			msg = m
-		} else if m, ok := data["message"].(string); ok && m != "" {
-			msg = m
+		req, err := http.NewRequestWithContext(ctx, method, u, reader)
+		if err != nil {
+			return err
 		}
-		return &Error{Message: msg, Status: resp.StatusCode, Body: data}
+		req.Header.Set("X-API-Key", c.secretKey)
+		req.Header.Set("Accept", "application/json")
+		if bodyBytes != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if idempotencyKey != "" {
+			req.Header.Set("Idempotency-Key", idempotencyKey)
+		}
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			if canRetry && attempt < c.maxRetries {
+				time.Sleep(time.Duration(250*(1<<attempt)) * time.Millisecond)
+				continue
+			}
+			return &Error{Message: fmt.Sprintf("could not reach Cyzora: %v", err)}
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		data := map[string]interface{}{}
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &data)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			transient := resp.StatusCode >= 500 || resp.StatusCode == 429
+			if transient && canRetry && attempt < c.maxRetries {
+				time.Sleep(time.Duration(250*(1<<attempt)) * time.Millisecond)
+				continue
+			}
+			msg := fmt.Sprintf("Cyzora request failed (%d)", resp.StatusCode)
+			if m, ok := data["error"].(string); ok && m != "" {
+				msg = m
+			} else if m, ok := data["message"].(string); ok && m != "" {
+				msg = m
+			}
+			return &Error{Message: msg, Status: resp.StatusCode, Body: data}
+		}
+		if out != nil && len(raw) > 0 {
+			return json.Unmarshal(raw, out)
+		}
+		return nil
 	}
-	if out != nil && len(raw) > 0 {
-		return json.Unmarshal(raw, out)
-	}
-	return nil
+}
+
+// Request is an escape hatch for any endpoint, including new ones the rail adds
+// before this SDK ships a typed wrapper. path is appended to the base URL.
+func (c *Client) Request(ctx context.Context, method, path string, body interface{}, idempotencyKey string, query map[string]string) (map[string]interface{}, error) {
+	out := map[string]interface{}{}
+	err := c.do(ctx, method, path, body, idempotencyKey, query, &out)
+	return out, err
 }
 
 // ChargeParams describes an STK push.
