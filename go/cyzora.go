@@ -324,6 +324,20 @@ func (c *Client) VerifyWebhookSignature(rawBody []byte, signature string) bool {
 	return false
 }
 
+// ConstructWebhookEvent verifies the signature (against every configured secret)
+// and parses the body in one call. It returns an error if the signature is invalid
+// or the body is not JSON. rawBody must be the exact bytes received.
+func (c *Client) ConstructWebhookEvent(rawBody []byte, signature string) (map[string]interface{}, error) {
+	if !c.VerifyWebhookSignature(rawBody, signature) {
+		return nil, &Error{Message: "webhook signature verification failed", Status: 401}
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal(rawBody, &out); err != nil {
+		return nil, &Error{Message: "webhook body is not valid JSON", Status: 400}
+	}
+	return out, nil
+}
+
 func orDefault(v, def string) string {
 	if v == "" {
 		return def

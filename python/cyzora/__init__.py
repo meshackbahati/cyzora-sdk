@@ -271,3 +271,17 @@ class Cyzora:
             if hmac.compare_digest(expected, sig):
                 return True
         return False
+
+    def construct_webhook_event(self, raw_body: Union[str, bytes], signature: Optional[str]) -> Any:
+        """
+        Verify the signature (against every configured secret) and parse the body in
+        one call. Raises CyzoraError if the signature is invalid or the body is not
+        JSON. `raw_body` must be the exact bytes received.
+        """
+        if not self.verify_webhook_signature(raw_body, signature):
+            raise CyzoraError("Webhook signature verification failed", 401)
+        body = raw_body.decode("utf-8") if isinstance(raw_body, (bytes, bytearray)) else raw_body
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            raise CyzoraError("Webhook body is not valid JSON", 400)

@@ -248,6 +248,23 @@ export class Cyzora {
       }
     });
   }
+
+  /**
+   * Verify the signature (against every configured secret) and parse the body in
+   * one call. Throws CyzoraError if the signature is invalid or the body is not
+   * JSON. `rawBody` must be the exact bytes received.
+   */
+  constructWebhookEvent(rawBody: string | Buffer, signature: string | null | undefined): any {
+    if (!this.verifyWebhookSignature(rawBody, signature)) {
+      throw new CyzoraError('Webhook signature verification failed', 401);
+    }
+    const body = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8');
+    try {
+      return JSON.parse(body);
+    } catch {
+      throw new CyzoraError('Webhook body is not valid JSON', 400);
+    }
+  }
 }
 
 export default Cyzora;

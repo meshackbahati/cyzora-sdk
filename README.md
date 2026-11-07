@@ -123,6 +123,47 @@ $ok = $cyzora->verifyWebhookSignature($rawBody, $_SERVER['HTTP_X_CYZORA_SIGNATUR
 ok := client.VerifyWebhookSignature(rawBody, r.Header.Get("X-Cyzora-Signature"))
 ```
 
+### Verify + parse in one call
+
+`constructWebhookEvent` verifies the signature and parses the JSON body, throwing/returning
+an error if either fails — the usual one-liner in a webhook handler:
+
+```ts
+const event = cyzora.constructWebhookEvent(req.body, req.headers["x-cyzora-signature"]);
+switch (event.event) {
+  case "charge.succeeded": /* ... */ break;
+  case "payout.paid":      /* ... */ break;
+}
+```
+```python
+event = client.construct_webhook_event(raw_body, request.headers.get("X-Cyzora-Signature"))
+```
+```php
+$event = $cyzora->constructWebhookEvent($rawBody, $_SERVER['HTTP_X_CYZORA_SIGNATURE'] ?? null);
+```
+```go
+event, err := client.ConstructWebhookEvent(rawBody, r.Header.Get("X-Cyzora-Signature"))
+```
+
+### Multiple webhook secrets
+
+If you register more than one webhook endpoint (each gets its own `whsec_…`), pass them all
+and verification succeeds if the signature matches **any** of them:
+
+```ts
+new Cyzora({ secretKey, webhookSecrets: ["whsec_a...", "whsec_b..."] });
+```
+```python
+Cyzora(secret_key, webhook_secret=["whsec_a...", "whsec_b..."])
+```
+```php
+new \Cyzora\Client($secretKey, ['webhookSecret' => ['whsec_a...', 'whsec_b...']]);
+```
+```go
+cyzora.New(secretKey, cyzora.WithWebhookSecret("whsec_a..."), cyzora.WithWebhookSecret("whsec_b..."))
+```
+You can also set `CYZORA_WEBHOOK_SECRET` to a comma-separated list where the SDK reads it.
+
 ## API surface (all languages)
 
 | Method | Endpoint |
@@ -138,6 +179,7 @@ ok := client.VerifyWebhookSignature(rawBody, r.Header.Get("X-Cyzora-Signature"))
 | `listPayoutBanks` | `GET /payout-banks` |
 | `payoutFeePreview` | `GET /payouts/fee-preview` |
 | `verifyWebhookSignature` | local HMAC check |
+| `constructWebhookEvent` | verify + parse webhook body |
 
 Helpers exported everywhere: `normalizePhone`, `toCents`, `fromCents`, `PAYOUT_MIN_CENTS`.
 

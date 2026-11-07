@@ -302,4 +302,23 @@ class Client
         }
         return false;
     }
+
+    /**
+     * Verify the signature (against every configured secret) and parse the body in
+     * one call. Throws CyzoraException if the signature is invalid or the body is
+     * not JSON. $rawBody must be the exact bytes received.
+     *
+     * @return array<string,mixed>
+     */
+    public function constructWebhookEvent(string $rawBody, ?string $signature): array
+    {
+        if (!$this->verifyWebhookSignature($rawBody, $signature)) {
+            throw new CyzoraException('Webhook signature verification failed', 401);
+        }
+        $decoded = json_decode($rawBody, true);
+        if (!is_array($decoded)) {
+            throw new CyzoraException('Webhook body is not valid JSON', 400);
+        }
+        return $decoded;
+    }
 }
