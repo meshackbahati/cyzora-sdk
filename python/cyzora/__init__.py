@@ -28,11 +28,12 @@ from typing import Any, Dict, List, Optional, Union
 
 __all__ = [
     "Cyzora", "CyzoraError", "normalize_phone", "to_cents", "to_payout_cents", "from_cents",
-    "PAYOUT_MIN_CENTS", "WEBHOOK_EVENTS",
+    "PAYOUT_MIN_CENTS", "WEBHOOK_EVENTS", "METADATA_MAX_KEYS", "normalize_metadata",
 ]
 
 DEFAULT_BASE_URL = "https://api.cyzora.co.ke/api/v1"
 PAYOUT_MIN_CENTS = 3000  # KES 30
+METADATA_MAX_KEYS = 20  # most metadata keys the rail accepts on a charge or checkout
 
 #: Known webhook event names. The rail evolves, so also compare raw event strings.
 WEBHOOK_EVENTS = {
@@ -87,6 +88,37 @@ def to_payout_cents(amount_kes: Union[int, float], amount_cents: Optional[int] =
         raise CyzoraError("Payout amounts must be whole shillings (a multiple of 100 cents).")
     if cents < 1:
         raise CyzoraError("Amount must be at least KES 1.")
+    return int(cents)
+
+
+def normalize_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """The rail stores metadata as string pairs and refuses the whole request (HTTP 400)
+    if a value is a number, boolean or object, so convert values to strings here.
+    None values are dropped; dicts and lists become JSON; at most 20 keys."""
+    if not metadata:
+        return None
+    out: Dict[str, str] = {}
+    for k, v in metadata.items():
+        if v is None:
+            continue
+        if isinstance(v, str):
+            out[str(k)] = v
+        elif isinstance(v, bool):
+            out[str(k)] = "true" if v else "false"
+        elif isinstance(v, (dict, list, tuple)):
+            out[str(k)] = json.dumps(v, separators=(",", ":"))
+        else:
+            out[str(k)] = str(v)
+    if len(out) > METADATA_MAX_KEYS:
+        raise CyzoraError(f"metadata can hold at most {METADATA_MAX_KEYS} keys (got {len(out)}).")
+    return out or None
+
+
+def _move_cents(amount_kes: Union[int, float, None], amount_cents: Optional[int] = None) -> int:
+    """Exact cents for wallet moves: whole cents, greater than zero."""
+    cents = float(amount_cents) if amount_cents is not None else round(float(amount_kes or 0) * 100)
+    if not math.isfinite(cents) or not float(cents).is_integer() or cents <= 0:
+        raise CyzoraError("Amount must be greater than zero.")
     return int(cents)
 
 
@@ -203,7 +235,11 @@ class Cyzora:
         idempotency_key: Optional[str] = None,
         amount_cents: Optional[int] = None,
     ) -> Any:
-        """Send an M-Pesa STK prompt to a customer's phone."""
+        """Send an M-Pesa STK prompt to a customer's phone.
+
+        `description` is accepted for backwards compatibility but not sent: the rail
+        does not store a description on STK charges. `metadata` holds up to 20 keys;
+        values are sent as strings."""
         normalized = normalize_phone(phone)
         if not normalized:
             raise CyzoraError("Enter a valid M-Pesa phone number (e.g. 0712 345 678).")
@@ -213,14 +249,21 @@ class Cyzora:
         body: Dict[str, Any] = {"amount": cents, "phone": normalized, "network": network}
         if account_ref:
             body["account_ref"] = str(account_ref)[:64]
-        if description:
-            body["description"] = str(description)[:200]
-        if metadata:
-            body["metadata"] = metadata
+        meta = normalize_metadata(metadata)
+        if meta:
+            body["metadata"] = meta
         return self._request("/charges", "POST", body, idempotency_key)
 
     def get_charge(self, charge_id: str) -> Any:
         return self._request(f"/charges/{urllib.parse.quote(charge_id, safe='')}")
+
+    def list_charges(self, status: Optional[str] = None, from_date: Optional[str] = None,
+                     to_date: Optional[str] = None, mode: Optional[str] = None) -> Any:
+        """List charges, newest first (a list). Dates look like 2026-10-01; mode is
+        live (default), test or all. A test key only ever sees test charges."""
+        return self._request("/charges", query={
+            "status": status, "from_date": from_date, "to_date": to_date, "mode": mode,
+        })
 
     def export_charges(self, query: Optional[Dict[str, Any]] = None) -> str:
         """Download charges as CSV; from/to are dates such as 2026-10-01."""
@@ -253,8 +296,9 @@ class Cyzora:
             body["customer_phone"] = normalize_phone(customer_phone) or customer_phone
         if customer_email:
             body["customer_email"] = customer_email
-        if metadata:
-            body["metadata"] = metadata
+        meta = normalize_metadata(metadata)
+        if meta:
+            body["metadata"] = meta
         if expires_in:
             body["expires_in"] = int(expires_in)
         return self._request("/transactions/initialize", "POST", body, idempotency_key)
@@ -322,11 +366,65 @@ class Cyzora:
         return self._request(f"/payouts/{urllib.parse.quote(payout_id, safe='')}")
 
     def list_payouts(self, query: Optional[Dict[str, Any]] = None) -> Any:
+        """List payouts, newest first. Returns a plain list (not {"data": [...]}).
+        The rail does not filter this list yet; `query` is forwarded as-is."""
         return self._request("/payouts", query=query or {})
+
+    def list_payout_batches(self) -> Any:
+        """Bulk payout batches (created in the dashboard). Read-only by API key."""
+        return self._request("/payouts/batches")
+
+    def get_payout_batch(self, batch_id: str) -> Any:
+        return self._request(f"/payouts/batches/{urllib.parse.quote(batch_id, safe='')}")
 
     def get_wallets(self) -> Any:
         """Balances (in cents) for collections, collections_pending and payouts wallets."""
         return self._request("/wallets")
+
+    # -- wallet moves ------------------------------------------------------
+    def preview_wallet_move(self, amount_kes: Union[int, float, None] = None,
+                            amount_cents: Optional[int] = None) -> Any:
+        """Preview moving money from Collections into the Payouts wallet."""
+        return self._request("/wallets/move/preview", query={"amount": _move_cents(amount_kes, amount_cents)})
+
+    def move_to_payouts(self, amount_kes: Union[int, float, None] = None, idempotency_key: Optional[str] = None,
+                        amount_cents: Optional[int] = None) -> Any:
+        """Move money from Collections into the Payouts wallet. Live keys only."""
+        return self._request("/wallets/move", "POST", {"amount": _move_cents(amount_kes, amount_cents)},
+                             idempotency_key)
+
+    def list_wallet_transfers(self, limit: Optional[int] = None) -> Any:
+        """Past Collections -> Payouts moves: {"data": [...]}."""
+        return self._request("/wallets/transfers", query={"limit": limit})
+
+    def list_subsidiaries(self) -> Any:
+        """Subsidiary businesses this account can top up: {"data": [...]}."""
+        return self._request("/wallets/subsidiaries")
+
+    def preview_subsidiary_transfer(self, subsidiary_id: str, amount_kes: Union[int, float, None] = None,
+                                    from_wallet: Optional[str] = None, amount_cents: Optional[int] = None) -> Any:
+        """Preview topping up a subsidiary's Payouts wallet. from_wallet: collections | payouts."""
+        if not subsidiary_id:
+            raise CyzoraError("subsidiary_id is required.")
+        return self._request("/wallets/subsidiary-transfers/preview", query={
+            "subsidiary_id": subsidiary_id, "from_wallet": from_wallet,
+            "amount": _move_cents(amount_kes, amount_cents),
+        })
+
+    def create_subsidiary_transfer(self, subsidiary_id: str, amount_kes: Union[int, float, None] = None,
+                                   from_wallet: Optional[str] = None, idempotency_key: Optional[str] = None,
+                                   amount_cents: Optional[int] = None) -> Any:
+        """Top up a subsidiary's Payouts wallet from this account. Live keys only."""
+        if not subsidiary_id:
+            raise CyzoraError("subsidiary_id is required.")
+        body: Dict[str, Any] = {"subsidiary_id": subsidiary_id, "amount": _move_cents(amount_kes, amount_cents)}
+        if from_wallet:
+            body["from_wallet"] = from_wallet
+        return self._request("/wallets/subsidiary-transfers", "POST", body, idempotency_key)
+
+    def list_subsidiary_transfers(self, limit: Optional[int] = None) -> Any:
+        """Past subsidiary top-ups: {"data": [...]}."""
+        return self._request("/wallets/subsidiary-transfers", query={"limit": limit})
 
     def list_payout_channels(self) -> Any:
         return self._request("/payout-channels")

@@ -31,6 +31,8 @@ import (
 const (
 	DefaultBaseURL = "https://api.cyzora.co.ke/api/v1"
 	PayoutMinCents = 3000 // KES 30
+	// MetadataMaxKeys is the most metadata keys the rail accepts on a charge or checkout session.
+	MetadataMaxKeys = 20
 )
 
 // Error is returned for any non-2xx response or transport failure.
@@ -159,6 +161,57 @@ func payoutCents(amountKes float64, amountCents int64) (int64, error) {
 	return cents, nil
 }
 
+// NormalizeMetadata converts metadata values to strings. The rail stores
+// metadata as string pairs and refuses the whole request (HTTP 400) if a value
+// is a number, boolean or object. Nil values are dropped; maps and slices
+// become JSON; at most MetadataMaxKeys keys.
+func NormalizeMetadata(metadata map[string]interface{}) (map[string]string, error) {
+	if len(metadata) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		switch t := v.(type) {
+		case nil:
+			continue
+		case string:
+			out[k] = t
+		case fmt.Stringer:
+			out[k] = t.String()
+		case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+			out[k] = fmt.Sprint(t)
+		default:
+			b, err := json.Marshal(t)
+			if err != nil {
+				return nil, &Error{Message: fmt.Sprintf("metadata %q could not be encoded: %v", k, err)}
+			}
+			out[k] = string(b)
+		}
+	}
+	if len(out) > MetadataMaxKeys {
+		return nil, &Error{Message: fmt.Sprintf("metadata can hold at most %d keys (got %d)", MetadataMaxKeys, len(out))}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// moveCents gives exact cents for wallet moves: whole cents, greater than zero.
+func moveCents(amountKes float64, amountCents int64) (int64, error) {
+	cents := amountCents
+	if cents == 0 {
+		if math.IsNaN(amountKes) || math.IsInf(amountKes, 0) {
+			return 0, &Error{Message: "amount must be a number"}
+		}
+		cents = int64(math.Round(amountKes * 100))
+	}
+	if cents <= 0 {
+		return 0, &Error{Message: "amount must be greater than zero"}
+	}
+	return cents, nil
+}
+
 // FromCents converts integer cents back to shillings.
 func FromCents(cents int64) float64 { return float64(cents) / 100 }
 
@@ -261,6 +314,13 @@ func (c *Client) Request(ctx context.Context, method, path string, body interfac
 	return out, err
 }
 
+// RequestInto is like Request but decodes into out, so endpoints that return a
+// JSON array (or a struct you define) work too: pass a pointer such as
+// &[]map[string]interface{}{} or *string for raw text.
+func (c *Client) RequestInto(ctx context.Context, method, path string, body interface{}, idempotencyKey string, query map[string]string, out interface{}) error {
+	return c.do(ctx, method, path, body, idempotencyKey, query, out, true)
+}
+
 // PublicRequest calls an endpoint that needs no secret key, such as statement
 // verification. It follows the same retry and parsing rules as Request.
 func (c *Client) PublicRequest(ctx context.Context, method, path string, query map[string]string) (map[string]interface{}, error) {
@@ -271,12 +331,14 @@ func (c *Client) PublicRequest(ctx context.Context, method, path string, query m
 
 // ChargeParams describes an STK push.
 type ChargeParams struct {
-	AmountKes      float64
-	AmountCents    int64
-	Phone          string
-	Network        string
-	AccountRef     string
-	Description    string
+	AmountKes   float64
+	AmountCents int64
+	Phone       string
+	Network     string
+	AccountRef  string
+	// Deprecated: the rail does not store a description on STK charges; it is no longer sent.
+	Description string
+	// Metadata holds up to 20 keys; values are sent as strings.
 	Metadata       map[string]interface{}
 	IdempotencyKey string
 }
@@ -307,14 +369,32 @@ func (c *Client) CreateCharge(ctx context.Context, p ChargeParams) (map[string]i
 	if p.AccountRef != "" {
 		body["account_ref"] = trunc(p.AccountRef, 64)
 	}
-	if p.Description != "" {
-		body["description"] = trunc(p.Description, 200)
+	meta, err := NormalizeMetadata(p.Metadata)
+	if err != nil {
+		return nil, err
 	}
-	if p.Metadata != nil {
-		body["metadata"] = p.Metadata
+	if meta != nil {
+		body["metadata"] = meta
 	}
 	out := map[string]interface{}{}
-	err := c.do(ctx, http.MethodPost, "/charges", body, p.IdempotencyKey, nil, &out, true)
+	err = c.do(ctx, http.MethodPost, "/charges", body, p.IdempotencyKey, nil, &out, true)
+	return out, err
+}
+
+// ListChargesParams filters ListCharges. Dates look like 2026-10-01; Mode is
+// live (default), test or all. A test key only ever sees test charges.
+type ListChargesParams struct {
+	Status   string
+	FromDate string
+	ToDate   string
+	Mode     string
+}
+
+// ListCharges lists charges, newest first.
+func (c *Client) ListCharges(ctx context.Context, p ListChargesParams) ([]map[string]interface{}, error) {
+	out := []map[string]interface{}{}
+	query := map[string]string{"status": p.Status, "from_date": p.FromDate, "to_date": p.ToDate, "mode": p.Mode}
+	err := c.do(ctx, http.MethodGet, "/charges", nil, "", query, &out, true)
 	return out, err
 }
 
@@ -371,8 +451,12 @@ func (c *Client) CreateCheckoutSession(ctx context.Context, p CheckoutParams) (m
 	if p.CustomerEmail != "" {
 		body["customer_email"] = p.CustomerEmail
 	}
-	if p.Metadata != nil {
-		body["metadata"] = p.Metadata
+	meta, err := NormalizeMetadata(p.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	if meta != nil {
+		body["metadata"] = meta
 	}
 	if p.ExpiresIn != 0 {
 		body["expires_in"] = p.ExpiresIn
@@ -461,11 +545,127 @@ func (c *Client) GetPayout(ctx context.Context, payoutID string) (map[string]int
 	return out, err
 }
 
-// ListPayouts lists payouts, optionally filtered by from, to and status.
-func (c *Client) ListPayouts(ctx context.Context, query map[string]string) (map[string]interface{}, error) {
-	out := map[string]interface{}{}
+// ListPayouts lists payouts, newest first. The rail returns a JSON array and
+// does not filter this list yet; query is forwarded as-is.
+func (c *Client) ListPayouts(ctx context.Context, query map[string]string) ([]map[string]interface{}, error) {
+	out := []map[string]interface{}{}
 	err := c.do(ctx, http.MethodGet, "/payouts", nil, "", query, &out, true)
 	return out, err
+}
+
+// ListPayoutBatches lists bulk payout batches (created in the dashboard; read-only by API key).
+func (c *Client) ListPayoutBatches(ctx context.Context) ([]map[string]interface{}, error) {
+	out := []map[string]interface{}{}
+	err := c.do(ctx, http.MethodGet, "/payouts/batches", nil, "", nil, &out, true)
+	return out, err
+}
+
+// GetPayoutBatch fetches one bulk payout batch with its rows.
+func (c *Client) GetPayoutBatch(ctx context.Context, batchID string) (map[string]interface{}, error) {
+	out := map[string]interface{}{}
+	err := c.do(ctx, http.MethodGet, "/payouts/batches/"+url.PathEscape(batchID), nil, "", nil, &out, true)
+	return out, err
+}
+
+// PreviewWalletMove previews moving money from Collections into the Payouts wallet.
+// Pass amountCents to give exact cents instead of shillings.
+func (c *Client) PreviewWalletMove(ctx context.Context, amountKes float64, amountCents int64) (map[string]interface{}, error) {
+	cents, err := moveCents(amountKes, amountCents)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]interface{}{}
+	err = c.do(ctx, http.MethodGet, "/wallets/move/preview", nil, "", map[string]string{"amount": fmt.Sprint(cents)}, &out, true)
+	return out, err
+}
+
+// WalletMoveParams describes a Collections -> Payouts move.
+type WalletMoveParams struct {
+	AmountKes      float64
+	AmountCents    int64
+	IdempotencyKey string
+}
+
+// MoveToPayouts moves money from Collections into the Payouts wallet. Live keys only.
+func (c *Client) MoveToPayouts(ctx context.Context, p WalletMoveParams) (map[string]interface{}, error) {
+	cents, err := moveCents(p.AmountKes, p.AmountCents)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]interface{}{}
+	err = c.do(ctx, http.MethodPost, "/wallets/move", map[string]interface{}{"amount": cents}, p.IdempotencyKey, nil, &out, true)
+	return out, err
+}
+
+// ListWalletTransfers lists past Collections -> Payouts moves ({"data": [...]}). limit 0 uses the rail default.
+func (c *Client) ListWalletTransfers(ctx context.Context, limit int) (map[string]interface{}, error) {
+	out := map[string]interface{}{}
+	err := c.do(ctx, http.MethodGet, "/wallets/transfers", nil, "", limitQuery(limit), &out, true)
+	return out, err
+}
+
+// ListSubsidiaries lists subsidiary businesses this account can top up ({"data": [...]}).
+func (c *Client) ListSubsidiaries(ctx context.Context) (map[string]interface{}, error) {
+	out := map[string]interface{}{}
+	err := c.do(ctx, http.MethodGet, "/wallets/subsidiaries", nil, "", nil, &out, true)
+	return out, err
+}
+
+// SubsidiaryTransferParams describes topping up a subsidiary's Payouts wallet.
+// FromWallet is the parent's wallet the money leaves: collections or payouts.
+type SubsidiaryTransferParams struct {
+	SubsidiaryID   string
+	AmountKes      float64
+	AmountCents    int64
+	FromWallet     string
+	IdempotencyKey string
+}
+
+// PreviewSubsidiaryTransfer previews a subsidiary top-up. Live keys only.
+func (c *Client) PreviewSubsidiaryTransfer(ctx context.Context, p SubsidiaryTransferParams) (map[string]interface{}, error) {
+	if p.SubsidiaryID == "" {
+		return nil, &Error{Message: "SubsidiaryID is required"}
+	}
+	cents, err := moveCents(p.AmountKes, p.AmountCents)
+	if err != nil {
+		return nil, err
+	}
+	query := map[string]string{"subsidiary_id": p.SubsidiaryID, "from_wallet": p.FromWallet, "amount": fmt.Sprint(cents)}
+	out := map[string]interface{}{}
+	err = c.do(ctx, http.MethodGet, "/wallets/subsidiary-transfers/preview", nil, "", query, &out, true)
+	return out, err
+}
+
+// CreateSubsidiaryTransfer tops up a subsidiary's Payouts wallet from this account. Live keys only.
+func (c *Client) CreateSubsidiaryTransfer(ctx context.Context, p SubsidiaryTransferParams) (map[string]interface{}, error) {
+	if p.SubsidiaryID == "" {
+		return nil, &Error{Message: "SubsidiaryID is required"}
+	}
+	cents, err := moveCents(p.AmountKes, p.AmountCents)
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]interface{}{"subsidiary_id": p.SubsidiaryID, "amount": cents}
+	if p.FromWallet != "" {
+		body["from_wallet"] = p.FromWallet
+	}
+	out := map[string]interface{}{}
+	err = c.do(ctx, http.MethodPost, "/wallets/subsidiary-transfers", body, p.IdempotencyKey, nil, &out, true)
+	return out, err
+}
+
+// ListSubsidiaryTransfers lists past subsidiary top-ups ({"data": [...]}). limit 0 uses the rail default.
+func (c *Client) ListSubsidiaryTransfers(ctx context.Context, limit int) (map[string]interface{}, error) {
+	out := map[string]interface{}{}
+	err := c.do(ctx, http.MethodGet, "/wallets/subsidiary-transfers", nil, "", limitQuery(limit), &out, true)
+	return out, err
+}
+
+func limitQuery(limit int) map[string]string {
+	if limit <= 0 {
+		return nil
+	}
+	return map[string]string{"limit": fmt.Sprint(limit)}
 }
 
 // GetWallets returns balances (in cents) for collections, collections_pending and payouts.

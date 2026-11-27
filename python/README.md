@@ -99,8 +99,8 @@ csv_text = client.export_charges({
 | `phone` | Customer number, normalized to `254XXXXXXXXX`. |
 | `network` | `mpesa`, `airtel`, or `tkash`. Defaults to `mpesa`. |
 | `account_ref` | Order or invoice reference, truncated to 64 characters. |
-| `description` | Optional description, truncated to 200 characters. |
-| `metadata` | Text key and value pairs returned on the charge and in webhooks. |
+| `description` | Deprecated and not sent: the rail does not store a description on STK charges. Use `account_ref` or `metadata`. |
+| `metadata` | Up to 20 key and value pairs returned on the charge and in webhooks. Values are sent as text, so numbers and booleans are converted for you. |
 | `idempotency_key` | Stable key, normally the order or invoice reference. |
 | `amount_cents` | Alternative to `amount_kes`. Odd cents are also rounded up. |
 
@@ -184,12 +184,32 @@ wallet as the payout so that the preview matches the charge. Bank codes used by
 ```python
 balances = client.get_wallets()
 channels = client.list_payout_channels()
-payouts = client.list_payouts({"status": "paid"})
-payout = client.get_payout(payouts["data"][0]["id"])
+charges = client.list_charges(status="succeeded", from_date="2026-10-01")
+payouts = client.list_payouts()          # a plain list, newest first
+payout = client.get_payout(payouts[0]["id"])
 statement = client.verify_statement("K7PX3MZQ9H2D")
 ```
 
-Wallet balances and payout amounts are returned in cents. `verify_statement` calls the
+`list_charges` and `list_payouts` return lists. `list_charges` filters by `status`,
+`from_date`, `to_date` and `mode` (`live`, `test` or `all`); `list_payouts` is not
+filtered by the rail yet. Wallet balances and payout amounts are returned in cents.
+
+## Moving money between wallets
+
+```python
+client.preview_wallet_move(5000)                       # fee and resulting balances
+client.move_to_payouts(5000, idempotency_key="move-2026-11-27")
+client.list_wallet_transfers(20)                       # {"data": [...]}
+
+# Parent businesses can top up a subsidiary's Payouts wallet.
+subs = client.list_subsidiaries()["data"]
+client.preview_subsidiary_transfer(subs[0]["id"], 2000, from_wallet="collections")
+client.create_subsidiary_transfer(subs[0]["id"], 2000, from_wallet="collections",
+                                  idempotency_key="sub-topup-1")
+```
+
+Wallet moves use real balances, so test keys are refused. Bulk payout batches are
+created in the dashboard; `list_payout_batches()` and `get_payout_batch(id)` read them. `verify_statement` calls the
 public statement endpoint and deliberately omits the API key. It returns validity,
 business name, period, generated time, balances in and out, transaction count, and the
 statement's SHA-256 digest.
@@ -334,14 +354,24 @@ do not change balances, and are not listed by `GET /payouts`.
 |---|---|
 | `create_charge` | `POST /charges` |
 | `get_charge` | `GET /charges/:id` |
+| `list_charges` | `GET /charges` |
 | `export_charges` | `GET /charges/export` |
 | `create_checkout_session` | `POST /transactions/initialize` |
 | `verify_transaction` | `GET /transactions/verify/:ref` |
 | `create_payout` | `POST /payouts` |
 | `get_payout` | `GET /payouts/:id` |
 | `list_payouts` | `GET /payouts` |
+| `list_payout_batches` | `GET /payouts/batches` |
+| `get_payout_batch` | `GET /payouts/batches/:id` |
 | `payout_fee_preview` | `GET /payouts/fee-preview` |
 | `get_wallets` | `GET /wallets` |
+| `preview_wallet_move` | `GET /wallets/move/preview` |
+| `move_to_payouts` | `POST /wallets/move` |
+| `list_wallet_transfers` | `GET /wallets/transfers` |
+| `list_subsidiaries` | `GET /wallets/subsidiaries` |
+| `preview_subsidiary_transfer` | `GET /wallets/subsidiary-transfers/preview` |
+| `create_subsidiary_transfer` | `POST /wallets/subsidiary-transfers` |
+| `list_subsidiary_transfers` | `GET /wallets/subsidiary-transfers` |
 | `list_payout_channels` | `GET /payout-channels` |
 | `list_payout_banks` | `GET /payout-banks` |
 | `verify_statement` | `GET /public/statements/verify/:code` |

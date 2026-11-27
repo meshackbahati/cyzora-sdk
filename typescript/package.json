@@ -1,6 +1,6 @@
 {
   "name": "cyzora",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Official-style Cyzora M-Pesa payment rail SDK for Node.js and TypeScript — charges, checkout, payouts, wallets and webhook verification.",
   "keywords": [
     "cyzora",

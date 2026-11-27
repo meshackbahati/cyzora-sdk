@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -189,5 +190,111 @@ func TestPublicStatementAndExport(t *testing.T) {
 	csv, err = c.ExportCharges(context.Background(), map[string]string{"status": "succeeded"})
 	if err != nil || !strings.HasPrefix(csv, "date,amount") {
 		t.Fatalf("ExportCharges: csv=%q err=%v", csv, err)
+	}
+}
+
+// recorder answers every request with reply and remembers the last one.
+type recorder struct {
+	method, uri, idem string
+	body              map[string]interface{}
+}
+
+func newRecorder(t *testing.T, reply string) (*recorder, *Client, func()) {
+	t.Helper()
+	rec := &recorder{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.method, rec.uri, rec.idem = r.Method, r.URL.RequestURI(), r.Header.Get("Idempotency-Key")
+		rec.body = nil
+		if raw, _ := io.ReadAll(r.Body); len(raw) > 0 {
+			_ = json.Unmarshal(raw, &rec.body)
+		}
+		w.Write([]byte(reply))
+	}))
+	return rec, New("sk_live_x", WithBaseURL(server.URL)), server.Close
+}
+
+func TestChargeMetadataAndDescription(t *testing.T) {
+	rec, c, done := newRecorder(t, `{}`)
+	defer done()
+	_, err := c.CreateCharge(context.Background(), ChargeParams{
+		AmountKes: 100, Phone: "0712345678", Description: "ignored",
+		Metadata: map[string]interface{}{"order_id": 1001, "paid": false, "skip": nil, "cart": map[string]int{"a": 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rec.body["description"]; ok {
+		t.Error("description should not be sent")
+	}
+	want := map[string]interface{}{"order_id": "1001", "paid": "false", "cart": `{"a":1}`}
+	got, _ := rec.body["metadata"].(map[string]interface{})
+	if len(got) != len(want) {
+		t.Fatalf("metadata = %v", got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("metadata[%s] = %v, want %v", k, got[k], v)
+		}
+	}
+
+	many := map[string]interface{}{}
+	for i := 0; i < 21; i++ {
+		many[fmt.Sprintf("k%d", i)] = i
+	}
+	if _, err := c.CreateCharge(context.Background(), ChargeParams{AmountKes: 100, Phone: "0712345678", Metadata: many}); err == nil {
+		t.Error("21 metadata keys should be refused")
+	}
+}
+
+func TestListsDecodeArrays(t *testing.T) {
+	rec, c, done := newRecorder(t, `[{"id":"a"},{"id":"b"}]`)
+	defer done()
+	charges, err := c.ListCharges(context.Background(), ListChargesParams{Status: "succeeded", FromDate: "2026-10-01", Mode: "all"})
+	if err != nil || len(charges) != 2 {
+		t.Fatalf("charges=%v err=%v", charges, err)
+	}
+	if rec.uri != "/charges?from_date=2026-10-01&mode=all&status=succeeded" {
+		t.Errorf("uri = %s", rec.uri)
+	}
+	payouts, err := c.ListPayouts(context.Background(), nil)
+	if err != nil || len(payouts) != 2 || payouts[1]["id"] != "b" {
+		t.Fatalf("payouts=%v err=%v", payouts, err)
+	}
+	if _, err := c.ListPayoutBatches(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var raw []map[string]interface{}
+	if err := c.RequestInto(context.Background(), http.MethodGet, "/payouts", nil, "", nil, &raw); err != nil || len(raw) != 2 {
+		t.Fatalf("RequestInto=%v err=%v", raw, err)
+	}
+}
+
+func TestWalletMoves(t *testing.T) {
+	rec, c, done := newRecorder(t, `{}`)
+	defer done()
+	ctx := context.Background()
+	if _, err := c.PreviewWalletMove(ctx, 1500.5, 0); err != nil || rec.uri != "/wallets/move/preview?amount=150050" {
+		t.Fatalf("uri=%s err=%v", rec.uri, err)
+	}
+	if _, err := c.MoveToPayouts(ctx, WalletMoveParams{AmountKes: 2000, IdempotencyKey: "MV-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if rec.method != http.MethodPost || rec.uri != "/wallets/move" || rec.body["amount"] != float64(200000) || rec.idem != "MV-1" {
+		t.Errorf("move: %s %s %v %q", rec.method, rec.uri, rec.body, rec.idem)
+	}
+	if _, err := c.CreateSubsidiaryTransfer(ctx, SubsidiaryTransferParams{SubsidiaryID: "sub_1", AmountKes: 500, FromWallet: "payouts", IdempotencyKey: "ST-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if rec.body["subsidiary_id"] != "sub_1" || rec.body["amount"] != float64(50000) || rec.body["from_wallet"] != "payouts" {
+		t.Errorf("subsidiary body = %v", rec.body)
+	}
+	if _, err := c.ListWalletTransfers(ctx, 10); err != nil || rec.uri != "/wallets/transfers?limit=10" {
+		t.Errorf("uri=%s err=%v", rec.uri, err)
+	}
+	if _, err := c.MoveToPayouts(ctx, WalletMoveParams{}); err == nil {
+		t.Error("zero move should be refused")
+	}
+	if _, err := c.CreateSubsidiaryTransfer(ctx, SubsidiaryTransferParams{AmountKes: 500}); err == nil {
+		t.Error("missing subsidiary should be refused")
 	}
 }

@@ -19,8 +19,31 @@ export interface ChargeParams {
   phone: string;
   network?: Network;
   accountRef?: string;
+  /** @deprecated The rail does not store a description on STK charges; it is no longer sent. */
   description?: string;
+  /** Up to 20 keys. Values are sent as strings (numbers and booleans are converted). */
   metadata?: Record<string, unknown>;
+  idempotencyKey?: string;
+}
+
+export interface ListChargesParams {
+  /** succeeded | pending | failed | timeout | expired | awaiting_payment */
+  status?: string;
+  /** First day to include, e.g. 2026-10-01. */
+  fromDate?: string;
+  /** Last day to include, e.g. 2026-10-31. */
+  toDate?: string;
+  /** live (default) | test | all. A test key only ever sees test charges. */
+  mode?: 'live' | 'test' | 'all';
+}
+
+export interface SubsidiaryTransferParams {
+  subsidiaryId: string;
+  amountKes: number;
+  /** Or supply exact cents instead of amountKes. */
+  amountCents?: number;
+  /** The parent's wallet the money leaves: collections | payouts. */
+  fromWallet?: 'collections' | 'payouts';
   idempotencyKey?: string;
 }
 
@@ -32,6 +55,7 @@ export interface CheckoutParams {
   cancelUrl?: string;
   customerPhone?: string;
   customerEmail?: string;
+  /** Up to 20 keys. Values are sent as strings (numbers and booleans are converted). */
   metadata?: Record<string, unknown>;
   expiresIn?: number;
   idempotencyKey?: string;
@@ -130,6 +154,35 @@ function payoutCents(amountKes: number, amountCents?: number): number {
   return cents;
 }
 
+/** Most metadata keys the rail accepts on a charge or checkout session. */
+export const METADATA_MAX_KEYS = 20;
+
+/**
+ * The rail stores metadata as string key/value pairs and refuses the whole
+ * request (HTTP 400) if any value is a number, boolean or object. Convert
+ * values to strings here so `{ orderId: 1001 }` works as expected.
+ */
+export function normalizeMetadata(metadata?: Record<string, unknown> | null): Record<string, string> | undefined {
+  if (!metadata) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(metadata)) {
+    if (v === undefined || v === null) continue;
+    out[k] = typeof v === 'string' ? v : typeof v === 'object' ? JSON.stringify(v) : String(v);
+  }
+  const n = Object.keys(out).length;
+  if (n > METADATA_MAX_KEYS) throw new CyzoraError(`metadata can hold at most ${METADATA_MAX_KEYS} keys (got ${n}).`);
+  return n ? out : undefined;
+}
+
+/** Exact cents for wallet moves: whole cents, greater than zero. */
+function moveCents(amountKes: number, amountCents?: number): number {
+  const cents = amountCents !== undefined ? Number(amountCents) : Math.round(Number(amountKes) * 100);
+  if (!Number.isFinite(cents) || !Number.isInteger(cents) || cents <= 0) {
+    throw new CyzoraError('Amount must be greater than zero.');
+  }
+  return cents;
+}
+
 const env = (): Record<string, string | undefined> =>
   typeof process !== 'undefined' && process.env ? process.env : {};
 
@@ -221,6 +274,7 @@ export class Cyzora {
       ? Math.ceil(Number(p.amountCents) / 100) * 100
       : toCents(p.amountKes);
     if (!Number.isFinite(cents) || !Number.isInteger(cents) || cents < 100) throw new CyzoraError('Amount must be a whole number of shillings, at least KES 1.');
+    const metadata = normalizeMetadata(p.metadata);
     return this._request('/charges', {
       method: 'POST',
       idempotencyKey: p.idempotencyKey,
@@ -229,14 +283,20 @@ export class Cyzora {
         phone,
         network: p.network || 'mpesa',
         ...(p.accountRef ? { account_ref: String(p.accountRef).slice(0, 64) } : {}),
-        ...(p.description ? { description: String(p.description).slice(0, 200) } : {}),
-        ...(p.metadata ? { metadata: p.metadata } : {}),
+        ...(metadata ? { metadata } : {}),
       },
     });
   }
 
   getCharge(chargeId: string) {
     return this._request(`/charges/${encodeURIComponent(chargeId)}`);
+  }
+
+  /** List charges, newest first. Returns an array. */
+  listCharges(p: ListChargesParams = {}) {
+    return this._request<any[]>('/charges', {
+      query: { status: p.status, from_date: p.fromDate, to_date: p.toDate, mode: p.mode },
+    });
   }
 
   /** Download charges as CSV; from/to are dates such as 2026-10-01. */
@@ -246,6 +306,7 @@ export class Cyzora {
 
   /** Hosted checkout session (redirect flow) instead of an STK push. */
   async createCheckoutSession(p: CheckoutParams) {
+    const metadata = normalizeMetadata(p.metadata);
     return this._request('/transactions/initialize', {
       method: 'POST',
       idempotencyKey: p.idempotencyKey,
@@ -257,7 +318,7 @@ export class Cyzora {
         ...(p.cancelUrl ? { cancel_url: p.cancelUrl } : {}),
         ...(p.customerPhone ? { customer_phone: normalizePhone(p.customerPhone) || p.customerPhone } : {}),
         ...(p.customerEmail ? { customer_email: p.customerEmail } : {}),
-        ...(p.metadata ? { metadata: p.metadata } : {}),
+        ...(metadata ? { metadata } : {}),
         ...(p.expiresIn ? { expires_in: Number(p.expiresIn) } : {}),
       },
     });
@@ -311,13 +372,78 @@ export class Cyzora {
     return this._request(`/payouts/${encodeURIComponent(payoutId)}`);
   }
 
-  listPayouts(query: { from?: string; to?: string; status?: string } = {}) {
-    return this._request('/payouts', { query });
+  /**
+   * List payouts, newest first. Returns a plain array (not `{ data: [...] }`).
+   * The rail does not filter this list yet; any query you pass is forwarded
+   * as-is for forward compatibility.
+   */
+  listPayouts(query: Record<string, string | number | undefined> = {}) {
+    return this._request<any[]>('/payouts', { query });
+  }
+
+  /** Bulk payout batches (created in the dashboard). Read-only by API key. */
+  listPayoutBatches() {
+    return this._request('/payouts/batches');
+  }
+
+  getPayoutBatch(batchId: string) {
+    return this._request(`/payouts/batches/${encodeURIComponent(batchId)}`);
   }
 
   /** Balances (in cents) for collections, collections_pending and payouts wallets. */
   getWallets() {
     return this._request('/wallets');
+  }
+
+  /** Preview moving money from Collections into the Payouts wallet (fee and resulting balances). */
+  async previewWalletMove(amountKes: number, amountCents?: number) {
+    return this._request('/wallets/move/preview', { query: { amount: moveCents(amountKes, amountCents) } });
+  }
+
+  /** Move money from Collections into the Payouts wallet. Live keys only. */
+  async moveToPayouts(amountKes: number, opts: { amountCents?: number; idempotencyKey?: string } = {}) {
+    return this._request('/wallets/move', {
+      method: 'POST',
+      idempotencyKey: opts.idempotencyKey,
+      body: { amount: moveCents(amountKes, opts.amountCents) },
+    });
+  }
+
+  /** Past Collections -> Payouts moves. Returns `{ data: [...] }`. */
+  listWalletTransfers(limit?: number) {
+    return this._request('/wallets/transfers', { query: { limit } });
+  }
+
+  /** Subsidiary businesses this account can top up. Returns `{ data: [...] }`. */
+  listSubsidiaries() {
+    return this._request('/wallets/subsidiaries');
+  }
+
+  /** Preview topping up a subsidiary's Payouts wallet. Live keys only. */
+  async previewSubsidiaryTransfer(p: Omit<SubsidiaryTransferParams, 'idempotencyKey'>) {
+    if (!p?.subsidiaryId) throw new CyzoraError('subsidiaryId is required.');
+    return this._request('/wallets/subsidiary-transfers/preview', {
+      query: { subsidiary_id: p.subsidiaryId, from_wallet: p.fromWallet, amount: moveCents(p.amountKes, p.amountCents) },
+    });
+  }
+
+  /** Top up a subsidiary's Payouts wallet from this account. Live keys only. */
+  async createSubsidiaryTransfer(p: SubsidiaryTransferParams) {
+    if (!p?.subsidiaryId) throw new CyzoraError('subsidiaryId is required.');
+    return this._request('/wallets/subsidiary-transfers', {
+      method: 'POST',
+      idempotencyKey: p.idempotencyKey,
+      body: {
+        subsidiary_id: p.subsidiaryId,
+        amount: moveCents(p.amountKes, p.amountCents),
+        ...(p.fromWallet ? { from_wallet: p.fromWallet } : {}),
+      },
+    });
+  }
+
+  /** Past subsidiary top-ups. Returns `{ data: [...] }`. */
+  listSubsidiaryTransfers(limit?: number) {
+    return this._request('/wallets/subsidiary-transfers', { query: { limit } });
   }
 
   listPayoutChannels() {

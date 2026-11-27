@@ -138,9 +138,21 @@ the payout so that the preview agrees with the charge.
 await cyzora.getWallets();            // collections / collections_pending / payouts (cents)
 await cyzora.listPayoutChannels();    // saved, verified destinations
 await cyzora.listPayoutBanks();       // bank codes for a payout form
-await cyzora.listPayouts({ status: "paid" });
+await cyzora.listCharges({ status: "succeeded", fromDate: "2026-10-01" }); // array
+await cyzora.listPayouts();           // plain array, newest first (not filtered by the rail yet)
 await cyzora.exportCharges({ from: "2026-10-01", to: "2026-10-07", status: "succeeded" }); // CSV text
 ```
+
+## Moving money between wallets
+
+```ts
+await cyzora.previewWalletMove(5000);                              // Collections -> Payouts
+await cyzora.moveToPayouts(5000, { idempotencyKey: "move-2026-11-27" });
+await cyzora.createSubsidiaryTransfer({                            // parent -> subsidiary
+  subsidiaryId: "sub_...", amountKes: 2000, fromWallet: "collections", idempotencyKey: "sub-topup-1",
+});
+```
+Wallet moves use real balances, so test keys are refused.
 
 ## Public statement verification
 
@@ -230,14 +242,21 @@ balance, and are not listed by `GET /payouts`.
 |---|---|
 | `createCharge` | `POST /charges` |
 | `getCharge` | `GET /charges/:id` |
+| `listCharges` | `GET /charges` |
 | `exportCharges` | `GET /charges/export` (CSV) |
 | `createCheckoutSession` | `POST /transactions/initialize` |
 | `verifyTransaction` | `GET /transactions/verify/:ref` |
 | `createPayout` | `POST /payouts` |
 | `getPayout` | `GET /payouts/:id` |
 | `listPayouts` | `GET /payouts` |
+| `listPayoutBatches` / `getPayoutBatch` | `GET /payouts/batches[/:id]` (read-only) |
 | `payoutFeePreview` | `GET /payouts/fee-preview` |
 | `getWallets` | `GET /wallets` |
+| `previewWalletMove` / `moveToPayouts` | `GET /wallets/move/preview`, `POST /wallets/move` |
+| `listWalletTransfers` | `GET /wallets/transfers` |
+| `listSubsidiaries` | `GET /wallets/subsidiaries` |
+| `previewSubsidiaryTransfer` / `createSubsidiaryTransfer` | `GET .../preview`, `POST /wallets/subsidiary-transfers` |
+| `listSubsidiaryTransfers` | `GET /wallets/subsidiary-transfers` |
 | `listPayoutChannels` | `GET /payout-channels` |
 | `listPayoutBanks` | `GET /payout-banks` |
 | `verifyStatement` | `GET /public/statements/verify/:code` (no key) |

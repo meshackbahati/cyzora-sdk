@@ -31,6 +31,8 @@ class Client
 {
     public const DEFAULT_BASE_URL = 'https://api.cyzora.co.ke/api/v1';
     public const PAYOUT_MIN_CENTS = 3000; // KES 30
+    /** Most metadata keys the rail accepts on a charge or checkout session. */
+    public const METADATA_MAX_KEYS = 20;
 
     /** Known webhook event names. The rail evolves, so also compare raw event strings. */
     public const WEBHOOK_EVENTS = [
@@ -107,6 +109,47 @@ class Client
         return (int)$cents;
     }
 
+    /**
+     * The rail stores metadata as string pairs and refuses the whole request (HTTP 400)
+     * if a value is a number, boolean or array, so convert values to strings here.
+     * Nulls are dropped; arrays become JSON; at most 20 keys.
+     *
+     * @param array<string,mixed>|null $metadata
+     * @return array<string,string>|null
+     */
+    public static function normalizeMetadata(?array $metadata): ?array
+    {
+        if (!$metadata) {
+            return null;
+        }
+        $out = [];
+        foreach ($metadata as $k => $v) {
+            if ($v === null) {
+                continue;
+            }
+            if (is_bool($v)) {
+                $v = $v ? 'true' : 'false';
+            } elseif (is_array($v) || is_object($v)) {
+                $v = json_encode($v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            }
+            $out[(string)$k] = (string)$v;
+        }
+        if (count($out) > self::METADATA_MAX_KEYS) {
+            throw new CyzoraException('metadata can hold at most ' . self::METADATA_MAX_KEYS . ' keys (got ' . count($out) . ').');
+        }
+        return $out ?: null;
+    }
+
+    /** Exact cents for wallet moves: whole cents, greater than zero. */
+    private static function moveCents($amountKes, ?int $amountCents = null): int
+    {
+        $cents = $amountCents !== null ? (float)$amountCents : round((float)$amountKes * 100);
+        if (!is_finite($cents) || floor($cents) != $cents || $cents <= 0) {
+            throw new CyzoraException('Amount must be greater than zero.');
+        }
+        return (int)$cents;
+    }
+
     public static function fromCents($cents): float
     {
         return round((float)($cents ?: 0)) / 100;
@@ -120,7 +163,7 @@ class Client
      * @param bool $raw Return the response text (CSV exports) instead of decoded JSON.
      * @return array<string,mixed>|string
      */
-    private function request(string $path, string $method = 'GET', ?array $body = null, ?string $idempotencyKey = null, ?array $query = null, bool $auth = true, bool $raw = false)
+    protected function request(string $path, string $method = 'GET', ?array $body = null, ?string $idempotencyKey = null, ?array $query = null, bool $auth = true, bool $raw = false)
     {
         $url = $this->baseUrl . $path;
         if ($query) {
@@ -223,11 +266,11 @@ class Client
         if (!empty($options['accountRef'])) {
             $body['account_ref'] = substr((string)$options['accountRef'], 0, 64);
         }
-        if (!empty($options['description'])) {
-            $body['description'] = substr((string)$options['description'], 0, 200);
-        }
-        if (!empty($options['metadata'])) {
-            $body['metadata'] = $options['metadata'];
+        // 'description' is accepted for backwards compatibility but not sent:
+        // the rail does not store a description on STK charges.
+        $metadata = self::normalizeMetadata($options['metadata'] ?? null);
+        if ($metadata) {
+            $body['metadata'] = $metadata;
         }
         return $this->request('/charges', 'POST', $body, $options['idempotencyKey'] ?? null);
     }
@@ -236,6 +279,23 @@ class Client
     public function getCharge(string $chargeId): array
     {
         return $this->request('/charges/' . rawurlencode($chargeId));
+    }
+
+    /**
+     * List charges, newest first (a list). Dates look like 2026-10-01; mode is
+     * live (default), test or all. A test key only ever sees test charges.
+     *
+     * @param array{status?:string, fromDate?:string, toDate?:string, mode?:string} $filters
+     * @return array<int,array<string,mixed>>
+     */
+    public function listCharges(array $filters = []): array
+    {
+        return $this->request('/charges', 'GET', null, null, [
+            'status' => $filters['status'] ?? null,
+            'from_date' => $filters['fromDate'] ?? null,
+            'to_date' => $filters['toDate'] ?? null,
+            'mode' => $filters['mode'] ?? null,
+        ]);
     }
 
     /** Download charges as CSV; from/to are dates such as 2026-10-01. */
@@ -253,11 +313,15 @@ class Client
         $body = ['amount' => self::toCents($amountKes)];
         foreach ([
             'accountRef' => 'account_ref', 'description' => 'description', 'callbackUrl' => 'callback_url',
-            'cancelUrl' => 'cancel_url', 'customerEmail' => 'customer_email', 'metadata' => 'metadata',
+            'cancelUrl' => 'cancel_url', 'customerEmail' => 'customer_email',
         ] as $opt => $field) {
             if (isset($options[$opt])) {
                 $body[$field] = $options[$opt];
             }
+        }
+        $metadata = self::normalizeMetadata($options['metadata'] ?? null);
+        if ($metadata) {
+            $body['metadata'] = $metadata;
         }
         if (!empty($options['customerPhone'])) {
             $body['customer_phone'] = self::normalizePhone((string)$options['customerPhone']) ?? $options['customerPhone'];
@@ -334,10 +398,115 @@ class Client
         return $this->request('/payouts/' . rawurlencode($payoutId));
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * List payouts, newest first. Returns a plain list (not ['data' => [...]]).
+     * The rail does not filter this list yet; $query is forwarded as-is.
+     *
+     * @return array<int,array<string,mixed>>
+     */
     public function listPayouts(?array $query = null): array
     {
         return $this->request('/payouts', 'GET', null, null, $query);
+    }
+
+    /**
+     * Bulk payout batches (created in the dashboard). Read-only by API key.
+     * @return array<string,mixed>
+     */
+    public function listPayoutBatches(): array
+    {
+        return $this->request('/payouts/batches');
+    }
+
+    /** @return array<string,mixed> */
+    public function getPayoutBatch(string $batchId): array
+    {
+        return $this->request('/payouts/batches/' . rawurlencode($batchId));
+    }
+
+    // -- wallet moves -----------------------------------------------------
+    /**
+     * Preview moving money from Collections into the Payouts wallet.
+     * @return array<string,mixed>
+     */
+    public function previewWalletMove($amountKes, ?int $amountCents = null): array
+    {
+        return $this->request('/wallets/move/preview', 'GET', null, null, ['amount' => self::moveCents($amountKes, $amountCents)]);
+    }
+
+    /**
+     * Move money from Collections into the Payouts wallet. Live keys only.
+     * @param array{amountCents?:int, idempotencyKey?:string} $options
+     * @return array<string,mixed>
+     */
+    public function moveToPayouts($amountKes, array $options = []): array
+    {
+        $body = ['amount' => self::moveCents($amountKes, $options['amountCents'] ?? null)];
+        return $this->request('/wallets/move', 'POST', $body, $options['idempotencyKey'] ?? null);
+    }
+
+    /**
+     * Past Collections -> Payouts moves: ['data' => [...]].
+     * @return array<string,mixed>
+     */
+    public function listWalletTransfers(?int $limit = null): array
+    {
+        return $this->request('/wallets/transfers', 'GET', null, null, ['limit' => $limit]);
+    }
+
+    /**
+     * Subsidiary businesses this account can top up: ['data' => [...]].
+     * @return array<string,mixed>
+     */
+    public function listSubsidiaries(): array
+    {
+        return $this->request('/wallets/subsidiaries');
+    }
+
+    /**
+     * Preview topping up a subsidiary's Payouts wallet. fromWallet: collections | payouts.
+     * @param array{fromWallet?:string, amountCents?:int} $options
+     * @return array<string,mixed>
+     */
+    public function previewSubsidiaryTransfer(string $subsidiaryId, $amountKes, array $options = []): array
+    {
+        if ($subsidiaryId === '') {
+            throw new CyzoraException('subsidiaryId is required.');
+        }
+        return $this->request('/wallets/subsidiary-transfers/preview', 'GET', null, null, [
+            'subsidiary_id' => $subsidiaryId,
+            'from_wallet' => $options['fromWallet'] ?? null,
+            'amount' => self::moveCents($amountKes, $options['amountCents'] ?? null),
+        ]);
+    }
+
+    /**
+     * Top up a subsidiary's Payouts wallet from this account. Live keys only.
+     * @param array{fromWallet?:string, amountCents?:int, idempotencyKey?:string} $options
+     * @return array<string,mixed>
+     */
+    public function createSubsidiaryTransfer(string $subsidiaryId, $amountKes, array $options = []): array
+    {
+        if ($subsidiaryId === '') {
+            throw new CyzoraException('subsidiaryId is required.');
+        }
+        $body = [
+            'subsidiary_id' => $subsidiaryId,
+            'amount' => self::moveCents($amountKes, $options['amountCents'] ?? null),
+        ];
+        if (!empty($options['fromWallet'])) {
+            $body['from_wallet'] = $options['fromWallet'];
+        }
+        return $this->request('/wallets/subsidiary-transfers', 'POST', $body, $options['idempotencyKey'] ?? null);
+    }
+
+    /**
+     * Past subsidiary top-ups: ['data' => [...]].
+     * @return array<string,mixed>
+     */
+    public function listSubsidiaryTransfers(?int $limit = null): array
+    {
+        return $this->request('/wallets/subsidiary-transfers', 'GET', null, null, ['limit' => $limit]);
     }
 
     /** @return array<string,mixed> */

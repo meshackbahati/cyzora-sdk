@@ -88,8 +88,8 @@ The third argument to `createCharge` accepts these options:
 | `amountCents` | Alternative to the first argument. Odd cents are also rounded up. |
 | `network` | `mpesa`, `airtel`, or `tkash`. Defaults to `mpesa`. |
 | `accountRef` | Order or invoice reference, truncated to 64 characters. |
-| `description` | Optional description, truncated to 200 characters. |
-| `metadata` | Text key and value pairs returned on the charge and in webhooks. |
+| `description` | Deprecated and not sent: the rail does not store a description on STK charges. Use `accountRef` or `metadata`. |
+| `metadata` | Up to 20 key and value pairs returned on the charge and in webhooks. Values are sent as text, so numbers and booleans are converted for you. |
 | `idempotencyKey` | Stable key, normally the order or invoice reference. |
 
 Phone numbers are normalized from `0712345678`, `+254712345678`, or `712345678` to
@@ -169,10 +169,33 @@ wallet as the payout so that the preview matches the charge. Bank codes used by
 ```php
 $balances = $cyzora->getWallets();
 $channels = $cyzora->listPayoutChannels();
-$payouts = $cyzora->listPayouts(['status' => 'paid']);
-$payout = $cyzora->getPayout($payouts['data'][0]['id']);
+$charges = $cyzora->listCharges(['status' => 'succeeded', 'fromDate' => '2026-10-01']);
+$payouts = $cyzora->listPayouts();          // a plain list, newest first
+$payout = $cyzora->getPayout($payouts[0]['id']);
 $statement = $cyzora->verifyStatement('K7PX3MZQ9H2D');
 ```
+
+`listCharges` filters by `status`, `fromDate`, `toDate` and `mode` (`live`, `test` or
+`all`); `listPayouts` is not filtered by the rail yet.
+
+## Moving money between wallets
+
+```php
+$cyzora->previewWalletMove(5000);                                // fee and resulting balances
+$cyzora->moveToPayouts(5000, ['idempotencyKey' => 'move-2026-11-27']);
+$cyzora->listWalletTransfers(20);                                // ['data' => [...]]
+
+// Parent businesses can top up a subsidiary's Payouts wallet.
+$subs = $cyzora->listSubsidiaries()['data'];
+$cyzora->previewSubsidiaryTransfer($subs[0]['id'], 2000, ['fromWallet' => 'collections']);
+$cyzora->createSubsidiaryTransfer($subs[0]['id'], 2000, [
+    'fromWallet' => 'collections',
+    'idempotencyKey' => 'sub-topup-1',
+]);
+```
+
+Wallet moves use real balances, so test keys are refused. Bulk payout batches are
+created in the dashboard; `listPayoutBatches()` and `getPayoutBatch($id)` read them.
 
 Wallet balances and payout amounts are returned in cents. `verifyStatement` calls the
 public statement endpoint and deliberately omits the API key. It returns validity,
@@ -321,14 +344,24 @@ do not change balances, and are not listed by `GET /payouts`.
 |---|---|
 | `createCharge` | `POST /charges` |
 | `getCharge` | `GET /charges/:id` |
+| `listCharges` | `GET /charges` |
 | `exportCharges` | `GET /charges/export` |
 | `createCheckoutSession` | `POST /transactions/initialize` |
 | `verifyTransaction` | `GET /transactions/verify/:ref` |
 | `createPayout` | `POST /payouts` |
 | `getPayout` | `GET /payouts/:id` |
 | `listPayouts` | `GET /payouts` |
+| `listPayoutBatches` | `GET /payouts/batches` |
+| `getPayoutBatch` | `GET /payouts/batches/:id` |
 | `payoutFeePreview` | `GET /payouts/fee-preview` |
 | `getWallets` | `GET /wallets` |
+| `previewWalletMove` | `GET /wallets/move/preview` |
+| `moveToPayouts` | `POST /wallets/move` |
+| `listWalletTransfers` | `GET /wallets/transfers` |
+| `listSubsidiaries` | `GET /wallets/subsidiaries` |
+| `previewSubsidiaryTransfer` | `GET /wallets/subsidiary-transfers/preview` |
+| `createSubsidiaryTransfer` | `POST /wallets/subsidiary-transfers` |
+| `listSubsidiaryTransfers` | `GET /wallets/subsidiary-transfers` |
 | `listPayoutChannels` | `GET /payout-channels` |
 | `listPayoutBanks` | `GET /payout-banks` |
 | `verifyStatement` | `GET /public/statements/verify/:code` |

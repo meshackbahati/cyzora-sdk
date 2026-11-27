@@ -69,4 +69,59 @@ try {
     check(strpos($e->getMessage(), 'accountRef') !== false, 'destination error message');
 }
 
+// Capture requests instead of sending them.
+class CapturingClient extends Client
+{
+    /** @var array<int,array<string,mixed>> */
+    public array $calls = [];
+
+    protected function request(string $path, string $method = 'GET', ?array $body = null, ?string $idempotencyKey = null, ?array $query = null, bool $auth = true, bool $raw = false)
+    {
+        $this->calls[] = compact('path', 'method', 'body', 'idempotencyKey', 'query');
+        return [];
+    }
+}
+
+$cap = new CapturingClient('sk_live_x');
+$cap->createCharge(100, '0712345678', [
+    'description' => 'ignored',
+    'metadata' => ['order_id' => 1001, 'paid' => false, 'skip' => null, 'cart' => ['a' => 1]],
+]);
+$last = end($cap->calls);
+check(!isset($last['body']['description']), 'charge description is not sent');
+check($last['body']['metadata'] === ['order_id' => '1001', 'paid' => 'false', 'cart' => '{"a":1}'], 'metadata values become strings');
+
+try {
+    $cap->createCharge(100, '0712345678', ['metadata' => array_fill_keys(array_map(fn($i) => "k$i", range(0, 20)), 1)]);
+    throw new RuntimeException('more than 20 metadata keys should be refused');
+} catch (CyzoraException $e) {
+    check(strpos($e->getMessage(), '20 keys') !== false, 'metadata cap message');
+}
+
+$cap->listCharges(['status' => 'succeeded', 'fromDate' => '2026-10-01', 'toDate' => '2026-10-31', 'mode' => 'all']);
+$last = end($cap->calls);
+check($last['path'] === '/charges' && $last['query'] === ['status' => 'succeeded', 'from_date' => '2026-10-01', 'to_date' => '2026-10-31', 'mode' => 'all'], 'listCharges query names');
+
+$cap->previewWalletMove(1500.5);
+check(end($cap->calls)['query'] === ['amount' => 150050], 'wallet move preview exact cents');
+
+$cap->moveToPayouts(2000, ['idempotencyKey' => 'MV-1']);
+$last = end($cap->calls);
+check($last['path'] === '/wallets/move' && $last['body'] === ['amount' => 200000] && $last['idempotencyKey'] === 'MV-1', 'wallet move payload');
+
+$cap->createSubsidiaryTransfer('sub_1', 500, ['fromWallet' => 'payouts', 'idempotencyKey' => 'ST-1']);
+check(end($cap->calls)['body'] === ['subsidiary_id' => 'sub_1', 'amount' => 50000, 'from_wallet' => 'payouts'], 'subsidiary transfer payload');
+
+$cap->getPayoutBatch('b 1');
+check(end($cap->calls)['path'] === '/payouts/batches/b%201', 'batch id is encoded');
+
+foreach ([fn() => $cap->moveToPayouts(0), fn() => $cap->createSubsidiaryTransfer('', 500)] as $bad) {
+    try {
+        $bad();
+        throw new RuntimeException('invalid wallet move should be refused');
+    } catch (CyzoraException $e) {
+        // expected
+    }
+}
+
 echo "PHP SDK tests passed\n";

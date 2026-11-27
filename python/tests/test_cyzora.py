@@ -174,5 +174,43 @@ class RequestTest(unittest.TestCase):
         self.assertIn("status=succeeded", call.call_args.args[0].full_url)
 
 
+    def test_metadata_values_become_strings_and_description_is_not_sent(self):
+        with patch("urllib.request.urlopen", return_value=FakeResponse("{}")) as call:
+            self.client.create_charge(100, "0712345678", description="ignored",
+                                      metadata={"order_id": 1001, "paid": False, "skip": None, "cart": {"a": 1}})
+        body = json.loads(call.call_args.args[0].data)
+        self.assertNotIn("description", body)
+        self.assertEqual(body["metadata"], {"order_id": "1001", "paid": "false", "cart": '{"a":1}'})
+
+    def test_metadata_key_cap(self):
+        with self.assertRaises(CyzoraError):
+            self.client.create_charge(100, "0712345678", metadata={f"k{i}": i for i in range(21)})
+
+    def test_list_charges_query_names(self):
+        with patch("urllib.request.urlopen", return_value=FakeResponse("[]")) as call:
+            result = self.client.list_charges(status="succeeded", from_date="2026-10-01", to_date="2026-10-31", mode="all")
+        self.assertEqual(result, [])
+        self.assertEqual(call.call_args.args[0].full_url,
+                         "https://example.test/api/v1/charges?status=succeeded&from_date=2026-10-01&to_date=2026-10-31&mode=all")
+
+    def test_wallet_move_and_subsidiary_transfer(self):
+        with patch("urllib.request.urlopen", return_value=FakeResponse("{}")) as call:
+            self.client.preview_wallet_move(1500.5)
+            self.assertEqual(call.call_args.args[0].full_url, "https://example.test/api/v1/wallets/move/preview?amount=150050")
+            self.client.move_to_payouts(2000, idempotency_key="MV-1")
+            req = call.call_args.args[0]
+            self.assertEqual(json.loads(req.data), {"amount": 200000})
+            self.assertEqual(req.get_header("Idempotency-key"), "MV-1")
+            self.client.create_subsidiary_transfer("sub_1", 500, from_wallet="payouts", idempotency_key="ST-1")
+            self.assertEqual(json.loads(call.call_args.args[0].data),
+                             {"subsidiary_id": "sub_1", "amount": 50000, "from_wallet": "payouts"})
+            self.client.get_payout_batch("b 1")
+            self.assertEqual(call.call_args.args[0].full_url, "https://example.test/api/v1/payouts/batches/b%201")
+        with self.assertRaises(CyzoraError):
+            self.client.move_to_payouts(0)
+        with self.assertRaises(CyzoraError):
+            self.client.create_subsidiary_transfer("", 500)
+
+
 if __name__ == "__main__":
     unittest.main()

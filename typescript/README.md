@@ -98,8 +98,8 @@ const csv = await cyzora.exportCharges({
 | `phone` | `string` | Customer number, normalized to `254XXXXXXXXX`. |
 | `network` | `'mpesa' \| 'airtel' \| 'tkash'` | Defaults to `mpesa`. |
 | `accountRef` | `string` | Order or invoice reference, truncated to 64 characters. |
-| `description` | `string` | Optional description, truncated to 200 characters. |
-| `metadata` | `Record<string, unknown>` | Text key and value pairs returned on the charge and in webhooks. |
+| `description` | `string` | Deprecated and not sent: the rail does not store a description on STK charges. Use `accountRef` or `metadata`. |
+| `metadata` | `Record<string, unknown>` | Up to 20 key and value pairs returned on the charge and in webhooks. Values are sent as text, so numbers and booleans are converted for you. |
 | `idempotencyKey` | `string` | Stable key, normally the order or invoice reference. |
 
 `exportCharges` returns the CSV response as a string. Valid export statuses include
@@ -198,12 +198,33 @@ wallet as the payout so that the preview matches the charge. Bank codes used by
 ```ts
 const balances = await cyzora.getWallets();
 const channels = await cyzora.listPayoutChannels();
-const payouts = await cyzora.listPayouts({ status: "paid" });
-const payout = await cyzora.getPayout(payouts.data[0].id);
+const charges = await cyzora.listCharges({ status: "succeeded", fromDate: "2026-10-01" });
+const payouts = await cyzora.listPayouts();          // a plain array, newest first
+const payout = await cyzora.getPayout(payouts[0].id);
 const statement = await cyzora.verifyStatement("K7PX3MZQ9H2D");
 ```
 
-Wallet balances and payout amounts are returned in cents. `verifyStatement` calls the
+`listCharges` and `listPayouts` return arrays. `listCharges` filters by `status`,
+`fromDate`, `toDate` and `mode` (`live`, `test` or `all`); `listPayouts` is not filtered
+by the rail yet. Wallet balances and payout amounts are returned in cents.
+
+## Moving money between wallets
+
+```ts
+await cyzora.previewWalletMove(5000);                            // fee and resulting balances
+await cyzora.moveToPayouts(5000, { idempotencyKey: "move-2026-11-27" });
+await cyzora.listWalletTransfers(20);                            // { data: [...] }
+
+// Parent businesses can top up a subsidiary's Payouts wallet.
+const { data: subs } = await cyzora.listSubsidiaries();
+await cyzora.previewSubsidiaryTransfer({ subsidiaryId: subs[0].id, amountKes: 2000, fromWallet: "collections" });
+await cyzora.createSubsidiaryTransfer({
+  subsidiaryId: subs[0].id, amountKes: 2000, fromWallet: "collections", idempotencyKey: "sub-topup-1",
+});
+```
+
+Wallet moves use real balances, so test keys are refused. Bulk payout batches are
+created in the dashboard; `listPayoutBatches()` and `getPayoutBatch(id)` read them. `verifyStatement` calls the
 public statement endpoint and deliberately omits the API key. It returns validity,
 business name, period, generated time, balances in and out, transaction count, and the
 statement's SHA-256 digest.
@@ -353,14 +374,24 @@ do not change balances, and are not listed by `GET /payouts`.
 |---|---|
 | `createCharge` | `POST /charges` |
 | `getCharge` | `GET /charges/:id` |
+| `listCharges` | `GET /charges` |
 | `exportCharges` | `GET /charges/export` |
 | `createCheckoutSession` | `POST /transactions/initialize` |
 | `verifyTransaction` | `GET /transactions/verify/:ref` |
 | `createPayout` | `POST /payouts` |
 | `getPayout` | `GET /payouts/:id` |
 | `listPayouts` | `GET /payouts` |
+| `listPayoutBatches` | `GET /payouts/batches` |
+| `getPayoutBatch` | `GET /payouts/batches/:id` |
 | `payoutFeePreview` | `GET /payouts/fee-preview` |
 | `getWallets` | `GET /wallets` |
+| `previewWalletMove` | `GET /wallets/move/preview` |
+| `moveToPayouts` | `POST /wallets/move` |
+| `listWalletTransfers` | `GET /wallets/transfers` |
+| `listSubsidiaries` | `GET /wallets/subsidiaries` |
+| `previewSubsidiaryTransfer` | `GET /wallets/subsidiary-transfers/preview` |
+| `createSubsidiaryTransfer` | `POST /wallets/subsidiary-transfers` |
+| `listSubsidiaryTransfers` | `GET /wallets/subsidiary-transfers` |
 | `listPayoutChannels` | `GET /payout-channels` |
 | `listPayoutBanks` | `GET /payout-banks` |
 | `verifyStatement` | `GET /public/statements/verify/:code` |

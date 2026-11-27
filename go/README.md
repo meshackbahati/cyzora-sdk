@@ -88,8 +88,8 @@ csvText, err := client.ExportCharges(ctx, map[string]string{
 | `Phone` | `string` | Customer number, normalized to `254XXXXXXXXX`. |
 | `Network` | `string` | `mpesa`, `airtel`, or `tkash`. Defaults to `mpesa`. |
 | `AccountRef` | `string` | Order or invoice reference, truncated to 64 characters. |
-| `Description` | `string` | Optional description, truncated to 200 characters. |
-| `Metadata` | `map[string]interface{}` | Text key and value pairs returned on the charge and in webhooks. |
+| `Description` | `string` | Deprecated and not sent: the rail does not store a description on STK charges. Use `AccountRef` or `Metadata`. |
+| `Metadata` | `map[string]interface{}` | Up to 20 key and value pairs returned on the charge and in webhooks. Values are sent as text, so numbers and booleans are converted for you. |
 | `IdempotencyKey` | `string` | Stable key, normally the order or invoice reference. |
 
 `NormalizePhone` converts `0712345678`, `+254712345678`, or `712345678` to
@@ -175,10 +175,31 @@ wallet as the payout so that the preview matches the charge. Bank codes used by
 ```go
 balances, err := client.GetWallets(ctx)
 channels, err := client.ListPayoutChannels(ctx)
-payouts, err := client.ListPayouts(ctx, map[string]string{"status": "paid"})
-payout, err := client.GetPayout(ctx, payoutID)
+charges, err := client.ListCharges(ctx, cyzora.ListChargesParams{Status: "succeeded", FromDate: "2026-10-01"})
+payouts, err := client.ListPayouts(ctx, nil) // []map[string]interface{}, newest first
+payout, err := client.GetPayout(ctx, payouts[0]["id"].(string))
 statement, err := client.VerifyStatement(ctx, "K7PX3MZQ9H2D")
 ```
+
+`ListCharges`, `ListPayouts` and `ListPayoutBatches` return `[]map[string]interface{}`
+because the rail answers with JSON arrays. `ListPayouts` is not filtered by the rail yet.
+
+## Moving money between wallets
+
+```go
+preview, err := client.PreviewWalletMove(ctx, 5000, 0) // fee and resulting balances
+move, err := client.MoveToPayouts(ctx, cyzora.WalletMoveParams{AmountKes: 5000, IdempotencyKey: "move-2026-11-27"})
+history, err := client.ListWalletTransfers(ctx, 20)    // {"data": [...]}
+
+// Parent businesses can top up a subsidiary's Payouts wallet.
+topup, err := client.CreateSubsidiaryTransfer(ctx, cyzora.SubsidiaryTransferParams{
+    SubsidiaryID: subID, AmountKes: 2000, FromWallet: "collections", IdempotencyKey: "sub-topup-1",
+})
+```
+
+Wallet moves use real balances, so test keys are refused. Bulk payout batches are
+created in the dashboard; `ListPayoutBatches` and `GetPayoutBatch` read them. For any
+endpoint that returns an array, `RequestInto` decodes into a value you pass.
 
 Wallet balances and payout amounts are returned in cents as
 `map[string]interface{}` values. `VerifyStatement` calls the public statement endpoint
@@ -328,20 +349,30 @@ do not change balances, and are not listed by `GET /payouts`.
 |---|---|
 | `CreateCharge` | `POST /charges` |
 | `GetCharge` | `GET /charges/:id` |
+| `ListCharges` | `GET /charges` |
 | `ExportCharges` | `GET /charges/export` |
 | `CreateCheckoutSession` | `POST /transactions/initialize` |
 | `VerifyTransaction` | `GET /transactions/verify/:ref` |
 | `CreatePayout` | `POST /payouts` |
 | `GetPayout` | `GET /payouts/:id` |
 | `ListPayouts` | `GET /payouts` |
+| `ListPayoutBatches` | `GET /payouts/batches` |
+| `GetPayoutBatch` | `GET /payouts/batches/:id` |
 | `PayoutFeePreview` | `GET /payouts/fee-preview` |
 | `GetWallets` | `GET /wallets` |
+| `PreviewWalletMove` | `GET /wallets/move/preview` |
+| `MoveToPayouts` | `POST /wallets/move` |
+| `ListWalletTransfers` | `GET /wallets/transfers` |
+| `ListSubsidiaries` | `GET /wallets/subsidiaries` |
+| `PreviewSubsidiaryTransfer` | `GET /wallets/subsidiary-transfers/preview` |
+| `CreateSubsidiaryTransfer` | `POST /wallets/subsidiary-transfers` |
+| `ListSubsidiaryTransfers` | `GET /wallets/subsidiary-transfers` |
 | `ListPayoutChannels` | `GET /payout-channels` |
 | `ListPayoutBanks` | `GET /payout-banks` |
 | `VerifyStatement` | `GET /public/statements/verify/:code` |
 | `VerifyWebhookSignature` | Local HMAC check |
 | `ConstructWebhookEvent` | Verify and parse webhook body |
-| `Request`, `PublicRequest` | Generic escape hatches |
+| `Request`, `RequestInto`, `PublicRequest` | Generic escape hatches |
 
 ## Development
 

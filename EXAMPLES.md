@@ -190,7 +190,10 @@ await cyzora.getWallets();                 // collections / collections_pending 
 await cyzora.listPayoutChannels();         // saved destinations
 await cyzora.listPayoutBanks();            // bank codes for a payout form
 await cyzora.payoutFeePreview(2500, "paybill", "collections");
-await cyzora.listPayouts({ status: "paid" });
+await cyzora.listCharges({ status: "succeeded", fromDate: "2026-10-01" }); // array
+await cyzora.listPayouts();                // plain array, newest first
+await cyzora.previewWalletMove(5000);      // Collections -> Payouts, fee shown
+await cyzora.moveToPayouts(5000, { idempotencyKey: "move-2026-11-27" });
 await cyzora.exportCharges({ from: "2026-10-01", to: "2026-10-07", status: "succeeded" }); // CSV text
 await cyzora.verifyStatement("K7PX3MZQ9H2D"); // public, no API key
 ```
